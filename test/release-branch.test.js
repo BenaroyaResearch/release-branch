@@ -1,5 +1,6 @@
 // Runs bin/release-branch.js against a throwaway origin (a bare repo on disk)
-// and a fake gh on PATH, so nothing here touches GitHub. The interactive
+// and a fake gh on PATH, so nothing here touches GitHub. The fake's `pr merge`
+// does a real --no-ff merge into the throwaway main. The interactive
 // confirmation is not exercised: with no terminal, `release` must never publish,
 // and that is what these tests check.
 
@@ -19,8 +20,21 @@ case "$1 $2" in
   "release view") [ -f "$GH_STATE/released" ] ;;
   "release create") touch "$GH_STATE/released" ;;
   "pr list") cat "$GH_STATE/pr.json" ;;
-  "pr view") exit 1 ;;
+  "pr view")
+    case "$*" in
+      *mergeStateStatus*) cat "$GH_STATE/view.json" ;;
+      *) exit 1 ;;
+    esac ;;
   "pr create") exit 0 ;;
+  "pr checks") cat "$GH_STATE/checks.json"; exit "$(cat "$GH_STATE/checks.exit" 2>/dev/null || echo 0)" ;;
+  "pr merge")
+    cd "$GH_WORK" && git checkout --quiet main \
+      && git merge --quiet --no-ff -m "Merge pull request #1" release/v1.13.0 \
+      && git push --quiet origin main 2>/dev/null || exit 1
+    head=$(git rev-parse HEAD)
+    git checkout --quiet release/v1.13.0
+    printf '[{"number":1,"url":"https://example.test/pull/1","state":"MERGED","mergeCommit":{"oid":"%s"}}]' "$head" > "$GH_STATE/pr.json"
+    printf '{"state":"MERGED"}' > "$GH_STATE/view.json" ;;
   "run list") echo "https://example.test/runs/1" ;;
   *) echo "unexpected: gh $*" >&2; exit 2 ;;
 esac
@@ -57,6 +71,16 @@ function fixture() {
 		number: 1, url: 'https://example.test/pull/1', state: prState, mergeCommit: mergeCommit && { oid: mergeCommit },
 	}]));
 	setPr('OPEN');
+	const bump = git('rev-parse', 'HEAD');
+	const setView = (fields = {}) => writeFileSync(join(state, 'view.json'), JSON.stringify({
+		state: 'OPEN', mergeStateStatus: 'CLEAN', headRefOid: bump, url: 'https://example.test/pull/1', ...fields,
+	}));
+	setView();
+	const setChecks = (checks, exitCode = 0) => {
+		writeFileSync(join(state, 'checks.json'), JSON.stringify(checks));
+		writeFileSync(join(state, 'checks.exit'), String(exitCode));
+	};
+	setChecks([{ name: 'ci / build', bucket: 'pass' }, { name: 'ci / warm-cache', bucket: 'skipping' }]);
 
 	const mergeToMain = (...mergeArgs) => {
 		git('checkout', '--quiet', 'main');
@@ -69,16 +93,22 @@ function fixture() {
 		return head;
 	};
 
-	const run = (...args) => spawnSync('node', [SCRIPT, ...args], {
+	const runWith = (options, ...args) => spawnSync('node', [SCRIPT, ...args], {
 		cwd: work,
 		encoding: 'utf8',
 		stdio: ['ignore', 'pipe', 'pipe'],
-		env: { ...process.env, GH_STATE: state, PATH: `${bin}:${process.env.PATH}` },
+		env: { ...process.env, GH_STATE: state, GH_WORK: work, PATH: `${bin}:${process.env.PATH}` },
+		...options,
 	});
+	const run = (...args) => runWith({}, ...args);
+	const onMain = sha => {
+		git('fetch', '--quiet', 'origin', 'main');
+		return spawnSync('git', ['merge-base', '--is-ancestor', sha, 'origin/main'], { cwd: work }).status === 0;
+	};
 	const published = () => existsSync(join(state, 'released'));
 	const calls = () => (existsSync(join(state, 'calls')) ? readFileSync(join(state, 'calls'), 'utf8') : '');
 
-	return { git, setPr, mergeToMain, run, published, calls, work };
+	return { git, setPr, setView, setChecks, mergeToMain, run, runWith, published, calls, onMain, bump, work };
 }
 
 test('release refuses a tag that is not on origin', () => {
@@ -198,4 +228,63 @@ test('check ignores gitignored files, such as build output', () => {
 	writeFileSync(join(f.work, 'dist', 'bundle.js'), '\n');
 	const r = f.run('check');
 	assert.equal(r.status, 0, r.stderr);
+});
+
+test('release merges the PR with a merge commit once every check passes', () => {
+	const f = fixture();
+	const r = f.run('release');
+	assert.equal(r.status, 0, r.stderr);
+	assert.match(r.stdout, /All 2 checks on \S+ passed/);
+	assert.ok(f.calls().includes(`gh pr merge 1 --merge --match-head-commit ${f.bump}`));
+	assert.ok(f.onMain(f.bump), 'the tagged commit is on main');
+	assert.match(r.stdout, /No terminal to confirm on/);
+	assert.equal(f.published(), false);
+});
+
+test('release does not merge while a check has failed', () => {
+	const f = fixture();
+	f.setChecks([{ name: 'ci / build', bucket: 'pass' }, { name: 'test / Jest', bucket: 'fail' }], 1);
+	const r = f.run('release');
+	assert.equal(r.status, 1);
+	assert.match(r.stderr, /Not merging \S+: test \/ Jest did not pass/);
+	assert.doesNotMatch(f.calls(), /pr merge/);
+	assert.equal(f.onMain(f.bump), false);
+});
+
+test('release does not merge a PR that is behind main, and says how to re-cut', () => {
+	const f = fixture();
+	f.setView({ mergeStateStatus: 'BEHIND' });
+	const r = f.run('release');
+	assert.equal(r.status, 1);
+	assert.match(r.stderr, /is behind it/);
+	assert.match(r.stderr, /git tag -d v1\.13\.0 && git push origin :refs\/tags\/v1\.13\.0/);
+	assert.doesNotMatch(f.calls(), /pr merge/);
+});
+
+test('release does not merge a PR with a commit after the bump', () => {
+	const f = fixture();
+	f.setView({ headRefOid: '0123456789abcdef0123456789abcdef01234567' });
+	const r = f.run('release');
+	assert.equal(r.status, 1);
+	assert.match(r.stderr, /has a commit after the v1\.13\.0 bump/);
+	assert.doesNotMatch(f.calls(), /pr merge/);
+});
+
+test('release --no-merge leaves an open PR for a person to merge', () => {
+	const f = fixture();
+	const r = f.runWith({ timeout: 3000 }, 'release', '--no-merge');
+	assert.equal(r.status, null, 'still waiting when the timeout stopped it');
+	assert.match(r.stdout, /Waiting for \S+ to merge into main/);
+	assert.doesNotMatch(f.calls(), /pr merge/);
+});
+
+test('publish opens the PR and carries on into release', () => {
+	const f = fixture();
+	const r = f.run('publish');
+	assert.equal(r.status, 0, r.stderr);
+	const calls = f.calls();
+	assert.ok(calls.indexOf('gh pr create') !== -1, 'opened the PR');
+	assert.ok(calls.indexOf('gh pr merge') > calls.indexOf('gh pr create'), 'merged after opening it');
+	assert.ok(f.onMain(f.bump));
+	assert.equal(f.published(), false);
 });
