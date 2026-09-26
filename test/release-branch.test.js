@@ -159,3 +159,43 @@ test('check refuses a main that is behind origin/main', () => {
 	assert.equal(r.status, 1);
 	assert.match(r.stderr, /does not match origin\/main/);
 });
+
+test('check passes on a clean main that matches origin/main', () => {
+	const f = fixture();
+	f.git('checkout', '--quiet', 'main');
+	const r = f.run('check');
+	assert.equal(r.status, 0, r.stderr);
+});
+
+test('check refuses an untracked file, which `git add -A` would commit', () => {
+	const f = fixture();
+	f.git('checkout', '--quiet', 'main');
+	execFileSync('mkdir', ['-p', join(f.work, 'notes')]);
+	writeFileSync(join(f.work, 'notes', 'scratch.txt'), 'wip\n');
+	const r = f.run('check');
+	assert.equal(r.status, 1);
+	assert.match(r.stderr, /working tree is not clean/);
+	assert.match(r.stderr, /\?\? notes\/scratch\.txt/); // the file, not just its directory
+});
+
+test('check refuses a modified tracked file', () => {
+	const f = fixture();
+	f.git('checkout', '--quiet', 'main');
+	writeFileSync(join(f.work, 'package.json'), '{"version":"1.12.0","edited":true}\n');
+	const r = f.run('check');
+	assert.equal(r.status, 1);
+	assert.match(r.stderr, / M package\.json/);
+});
+
+test('check ignores gitignored files, such as build output', () => {
+	const f = fixture();
+	f.git('checkout', '--quiet', 'main');
+	writeFileSync(join(f.work, '.gitignore'), 'dist/\n');
+	f.git('add', '.gitignore');
+	f.git('commit', '--quiet', '-m', 'ignore dist');
+	f.git('push', '--quiet', 'origin', 'main');
+	execFileSync('mkdir', ['-p', join(f.work, 'dist')]);
+	writeFileSync(join(f.work, 'dist', 'bundle.js'), '\n');
+	const r = f.run('check');
+	assert.equal(r.status, 0, r.stderr);
+});
