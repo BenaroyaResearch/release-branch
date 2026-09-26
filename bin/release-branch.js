@@ -14,14 +14,21 @@
 //     bump commit and tag never land on local main.
 //
 //   release-branch publish   (from the "postversion" hook)
-//     Push the branch and its tag, then open a PR into main with the GitHub
-//     CLI, or print the compare URL if gh is missing or the PR already exists.
+//     Push the branch and its tag, open a PR into main with the GitHub CLI
+//     (or print the compare URL if gh is missing), then carry straight on into
+//     `release`, so one `pnpm version` takes the release all the way.
 //
-//   release-branch release [vX.Y.Z]   (`pnpm run release`)
-//     Wait for the release PR to merge, check the tagged commit landed on
-//     main, then ask before publishing the GitHub release, because publishing
-//     starts the prod workflow and deploys to production. The tag defaults to
-//     the version in package.json, which is the new one on the release branch.
+//   release-branch release [vX.Y.Z] [--no-merge]   (`pnpm run release`)
+//     Wait for every check on the release PR, merge it with a merge commit
+//     once they all pass, check the tagged commit landed on main, then ask
+//     before publishing the GitHub release, because publishing starts the prod
+//     workflow and deploys to production. It refuses to merge a PR that is
+//     behind main, has a failed check, or holds anything after the bump.
+//     --no-merge, or RELEASE_BRANCH_NO_MERGE=1 in the environment (which also
+//     reaches the hooks), waits for someone else to merge instead, and makes
+//     `publish` stop once the PR is open. Stopping it at any
+//     point is safe, and running it again picks up where it left off. The tag
+//     defaults to the version in package.json, the new one on the branch.
 
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
@@ -30,6 +37,9 @@ import { setTimeout as sleep } from 'node:timers/promises';
 
 const BASE = 'main';
 const POLL_MS = 30_000;
+// For a caller that confirms the merge itself, such as an agent. Flags cannot
+// reach `pnpm version`'s hooks, so this is an environment variable.
+const NO_MERGE_ENV = process.env.RELEASE_BRANCH_NO_MERGE === '1';
 
 const run = (cmd, args) => execFileSync(cmd, args, { encoding: 'utf8' }).trim();
 const git = (...args) => run('git', args);
@@ -98,7 +108,7 @@ function compareUrl() {
 
 const hasGh = () => succeeds('gh', ['--version']);
 
-function publish() {
+async function publish() {
 	if (current === BASE) {
 		console.error(`\n❌ Still on ${BASE}; refusing to push the bump there.\n`);
 		process.exit(1);
@@ -108,7 +118,7 @@ function publish() {
 	passthrough('git', ['push', 'origin', `refs/tags/${tag}`]);
 
 	if (!hasGh()) {
-		console.log(`\nGitHub CLI not found. Open the PR here:\n  ${compareUrl()}\n`);
+		console.log(`\nGitHub CLI not found. Open the PR here, merge it with a merge commit, then publish the\nGitHub release from the existing ${tag} tag:\n  ${compareUrl()}\n`);
 		return;
 	}
 
@@ -121,10 +131,14 @@ function publish() {
 			'--base', BASE,
 			'--head', current,
 			'--title', `Release ${tag}`,
-			'--body', `Version bump to ${tag}. Merge with a **merge commit** (not squash/rebase) so the ${tag} tag stays on ${BASE}, then run \`pnpm run release\` (or publish the GitHub release from the existing tag).`,
+			'--body', `Version bump to ${tag}, opened by \`pnpm version\`. It merges this PR with a **merge commit** once every check passes (so the ${tag} tag stays on ${BASE}), then asks before publishing the GitHub release. If you merge it by hand, use a merge commit, not squash or rebase.`,
 		]);
 	}
-	console.log(`\nNext: run \`pnpm run release\`. It waits for this PR to merge, then asks before publishing ${tag} to production.\n`);
+	if (NO_MERGE_ENV) {
+		console.log(`\nRELEASE_BRANCH_NO_MERGE is set, so ${current} is left for you to merge (with a merge commit).\nThen \`pnpm run release\` asks before publishing ${tag}.\n`);
+		return;
+	}
+	await release([tag]);
 }
 
 function fail(message) {
@@ -140,6 +154,15 @@ function remoteTagCommit(name) {
 		.filter(Boolean)
 		.map(line => line.split('\t').reverse()));
 	return refs.get(`refs/tags/${name}^{}`) ?? refs.get(`refs/tags/${name}`);
+}
+
+function recut(name) {
+	return [
+		`   git switch ${BASE} && git pull`,
+		`   git tag -d ${name} && git push origin :refs/tags/${name}`,
+		`   git branch -D release/${name} && git push origin :release/${name}`,
+		'   pnpm version <the same bump>',
+	].join('\n');
 }
 
 function releasePr(name) {
@@ -172,6 +195,67 @@ async function waitForMerge(name, sha) {
 		}
 		if (!announced) {
 			console.log(`\nWaiting for ${pr ? pr.url : `a PR from release/${name}`} to merge into ${BASE} (checking every ${POLL_MS / 1000}s; Ctrl-C to stop and rerun later).`);
+			announced = true;
+		}
+		await sleep(POLL_MS); // eslint-disable-line no-await-in-loop
+	}
+}
+
+// gh exits 8 while checks are pending and 1 when one has failed; the JSON is on
+// stdout either way. No checks at all prints a message instead, read as none.
+function prChecks(number) {
+	let out;
+	try {
+		out = run('gh', ['pr', 'checks', String(number), '--json', 'name,bucket']);
+	} catch (error) {
+		out = String(error.stdout ?? '').trim();
+	}
+	try {
+		return JSON.parse(out || '[]');
+	} catch {
+		return [];
+	}
+}
+
+const prView = number => JSON.parse(run('gh', [
+	'pr', 'view', String(number), '--json', 'state,mergeStateStatus,headRefOid,url',
+]));
+
+// Merge the release PR once every check on it has passed, the staging deploy
+// included. Anything that would make the merged commit differ from the tagged
+// one stops it instead. If gh cannot merge (a review requirement, say), fall
+// back to waiting for a person to.
+async function mergeWhenGreen(number, sha, name) {
+	let announced = false;
+	let emptyPolls = 0;
+	for (;;) {
+		const view = prView(number);
+		if (view.state !== 'OPEN') return;
+		if (view.headRefOid !== sha) {
+			fail(`${view.url} has a commit after the ${name} bump (head ${view.headRefOid.slice(0, 7)}, tag ${sha.slice(0, 7)}), so the image for ${name} is not what the PR holds. Not merging. Close it and cut the release again:\n${recut(name)}`);
+		}
+		if (view.mergeStateStatus === 'BEHIND') {
+			fail(`${BASE} moved after ${name} was cut, so ${view.url} is behind it. Updating the branch would put commits after the tag, so it is not merged. Close it and cut the release again:\n${recut(name)}`);
+		}
+		const checks = prChecks(number);
+		const failed = checks.filter(check => check.bucket === 'fail' || check.bucket === 'cancel');
+		if (failed.length) {
+			fail(`Not merging ${view.url}: ${failed.map(check => check.name).join(', ')} did not pass. Re-run it and then \`pnpm run release\`, or fix it on ${BASE} and cut the release again.`);
+		}
+		if (checks.length && !checks.some(check => check.bucket === 'pending')) {
+			console.log(`\nAll ${checks.length} checks on ${view.url} passed. Merging it with a merge commit.`);
+			try {
+				passthrough('gh', ['pr', 'merge', String(number), '--merge', '--match-head-commit', sha]);
+			} catch {
+				console.log(`\ngh could not merge it. Merge ${view.url} with a merge commit on GitHub; this waits for that.`);
+			}
+			return;
+		}
+		if (!checks.length && ++emptyPolls > 10) {
+			fail(`No checks have reported on ${view.url} after ${(10 * POLL_MS) / 60_000} minutes. Make sure its workflows ran, then \`pnpm run release\`.`);
+		}
+		if (!announced) {
+			console.log(`\nWaiting for the checks on ${view.url}, which include the staging deploy (every ${POLL_MS / 1000}s; Ctrl-C to stop, \`pnpm run release\` picks up again).`);
 			announced = true;
 		}
 		await sleep(POLL_MS); // eslint-disable-line no-await-in-loop
@@ -211,13 +295,17 @@ async function findProdRun(sha) {
 	return `https://github.com/${repoSlug()}/actions/workflows/prod.yaml`;
 }
 
-async function release() {
-	const name = process.argv[3] ?? tag;
+async function release(args) {
+	const noMerge = args.includes('--no-merge') || NO_MERGE_ENV;
+	const name = args.find(arg => !arg.startsWith('--')) ?? tag;
 	if (!hasGh()) fail('The GitHub CLI (gh) is required to publish the release. Install it, or publish from the existing tag on GitHub.');
 
 	const sha = remoteTagCommit(name);
 	if (!sha) fail(`${name} is not on origin. Run \`pnpm version\` from ${BASE} first, or pass the tag: pnpm run release vX.Y.Z`);
 	if (succeeds('gh', ['release', 'view', name])) fail(`${name} already has a GitHub release; there is nothing to publish.`);
+
+	const open = releasePr(name);
+	if (open?.state === 'OPEN' && !noMerge) await mergeWhenGreen(open.number, sha, name);
 
 	const pr = await waitForMerge(name, sha);
 
@@ -248,9 +336,9 @@ async function release() {
 const mode = process.argv[2];
 if (mode === 'check') check();
 else if (mode === 'branch') branch();
-else if (mode === 'publish') publish();
-else if (mode === 'release') await release();
+else if (mode === 'publish') await publish();
+else if (mode === 'release') await release(process.argv.slice(3));
 else {
-	console.error('usage: release-branch check|branch|publish|release [vX.Y.Z]'); // eslint-disable-line no-console
+	console.error('usage: release-branch check|branch|publish|release [vX.Y.Z] [--no-merge]'); // eslint-disable-line no-console
 	process.exit(1);
 }
