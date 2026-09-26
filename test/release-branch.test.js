@@ -93,11 +93,12 @@ function fixture() {
 		return head;
 	};
 
+	const env = { GH_STATE: state, GH_WORK: work, PATH: `${bin}:${process.env.PATH}` };
 	const runWith = (options, ...args) => spawnSync('node', [SCRIPT, ...args], {
 		cwd: work,
 		encoding: 'utf8',
 		stdio: ['ignore', 'pipe', 'pipe'],
-		env: { ...process.env, GH_STATE: state, GH_WORK: work, PATH: `${bin}:${process.env.PATH}` },
+		env: { ...process.env, ...env },
 		...options,
 	});
 	const run = (...args) => runWith({}, ...args);
@@ -108,7 +109,7 @@ function fixture() {
 	const published = () => existsSync(join(state, 'released'));
 	const calls = () => (existsSync(join(state, 'calls')) ? readFileSync(join(state, 'calls'), 'utf8') : '');
 
-	return { git, setPr, setView, setChecks, mergeToMain, run, runWith, published, calls, onMain, bump, work };
+	return { git, setPr, setView, setChecks, mergeToMain, run, runWith, published, calls, onMain, bump, env, work };
 }
 
 test('release refuses a tag that is not on origin', () => {
@@ -287,4 +288,14 @@ test('publish opens the PR and carries on into release', () => {
 	assert.ok(calls.indexOf('gh pr merge') > calls.indexOf('gh pr create'), 'merged after opening it');
 	assert.ok(f.onMain(f.bump));
 	assert.equal(f.published(), false);
+});
+
+test('RELEASE_BRANCH_NO_MERGE=1 makes publish stop once the PR is open', () => {
+	const f = fixture();
+	const r = f.runWith({ env: { ...process.env, ...f.env, RELEASE_BRANCH_NO_MERGE: '1' } }, 'publish');
+	assert.equal(r.status, 0, r.stderr);
+	assert.match(r.stdout, /RELEASE_BRANCH_NO_MERGE is set/);
+	assert.match(f.calls(), /gh pr create/);
+	assert.doesNotMatch(f.calls(), /pr merge|pr checks/);
+	assert.equal(f.onMain(f.bump), false);
 });

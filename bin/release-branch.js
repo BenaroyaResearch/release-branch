@@ -24,7 +24,9 @@
 //     before publishing the GitHub release, because publishing starts the prod
 //     workflow and deploys to production. It refuses to merge a PR that is
 //     behind main, has a failed check, or holds anything after the bump.
-//     --no-merge waits for someone else to merge instead. Stopping it at any
+//     --no-merge, or RELEASE_BRANCH_NO_MERGE=1 in the environment (which also
+//     reaches the hooks), waits for someone else to merge instead, and makes
+//     `publish` stop once the PR is open. Stopping it at any
 //     point is safe, and running it again picks up where it left off. The tag
 //     defaults to the version in package.json, the new one on the branch.
 
@@ -35,6 +37,9 @@ import { setTimeout as sleep } from 'node:timers/promises';
 
 const BASE = 'main';
 const POLL_MS = 30_000;
+// For a caller that confirms the merge itself, such as an agent. Flags cannot
+// reach `pnpm version`'s hooks, so this is an environment variable.
+const NO_MERGE_ENV = process.env.RELEASE_BRANCH_NO_MERGE === '1';
 
 const run = (cmd, args) => execFileSync(cmd, args, { encoding: 'utf8' }).trim();
 const git = (...args) => run('git', args);
@@ -128,6 +133,10 @@ async function publish() {
 			'--title', `Release ${tag}`,
 			'--body', `Version bump to ${tag}, opened by \`pnpm version\`. It merges this PR with a **merge commit** once every check passes (so the ${tag} tag stays on ${BASE}), then asks before publishing the GitHub release. If you merge it by hand, use a merge commit, not squash or rebase.`,
 		]);
+	}
+	if (NO_MERGE_ENV) {
+		console.log(`\nRELEASE_BRANCH_NO_MERGE is set, so ${current} is left for you to merge (with a merge commit).\nThen \`pnpm run release\` asks before publishing ${tag}.\n`);
+		return;
 	}
 	await release([tag]);
 }
@@ -287,7 +296,7 @@ async function findProdRun(sha) {
 }
 
 async function release(args) {
-	const noMerge = args.includes('--no-merge');
+	const noMerge = args.includes('--no-merge') || NO_MERGE_ENV;
 	const name = args.find(arg => !arg.startsWith('--')) ?? tag;
 	if (!hasGh()) fail('The GitHub CLI (gh) is required to publish the release. Install it, or publish from the existing tag on GitHub.');
 

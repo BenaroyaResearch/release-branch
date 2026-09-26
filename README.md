@@ -40,7 +40,10 @@ checks, merging, or publishing.
 If `gh` cannot merge the PR (a required review, say), it says so and waits for
 you to merge it on GitHub, with a merge commit, then carries on. To have it
 never merge, and only wait for someone else to, use
-`pnpm run release --no-merge`.
+`pnpm run release --no-merge`, or set `RELEASE_BRANCH_NO_MERGE=1`, which also
+reaches `pnpm version`'s hooks: `publish` then stops once the PR is open. The
+bri-cicd plugin's `node-release` skill sets it, because Claude confirms the
+merge with you in chat.
 
 Pass a tag to release one from another branch: `pnpm run release v1.13.0`.
 
