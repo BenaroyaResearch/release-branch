@@ -5,8 +5,9 @@
 // through a PR (merge commit, so the tagged commit stays on main's history).
 //
 //   release-branch check     (from the "preversion" hook)
-//     Releases are cut from main only, and only from a main that matches
-//     origin/main after a fetch. Fail before anything is bumped otherwise.
+//     Releases are cut from main only, from a clean working tree (untracked
+//     files included), and only from a main that matches origin/main after a
+//     fetch. Fail before anything is bumped otherwise.
 //
 //   release-branch branch    (from the "version" hook)
 //     Move from main onto release/v<new version> before pnpm commits, so the
@@ -55,8 +56,22 @@ function requireBase() {
 	process.exit(1);
 }
 
+// The "version" hook ends in `git add -A`, which commits anything lying around
+// into the bump, untracked files included. Refuse before anything is bumped.
+function requireCleanTree() {
+	const dirty = execFileSync('git', ['status', '--porcelain', '--untracked-files=all'], { encoding: 'utf8' })
+		.split('\n')
+		.filter(Boolean);
+	if (dirty.length === 0) return;
+	const shown = dirty.slice(0, 10).map(line => `   ${line}`).join('\n');
+	const more = dirty.length > 10 ? `\n   … and ${dirty.length - 10} more` : '';
+	console.error(`\n❌ The working tree is not clean, and the version script's \`git add -A\` would commit this into the release:\n${shown}${more}\n\n   Commit, stash, remove or gitignore it, then run the release again.\n`);
+	process.exit(1);
+}
+
 function check() {
 	requireBase();
+	requireCleanTree();
 	passthrough('git', ['fetch', 'origin', BASE]);
 	const local = git('rev-parse', 'HEAD');
 	const remote = git('rev-parse', `origin/${BASE}`);

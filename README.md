@@ -12,7 +12,9 @@ same copy.
 
 1. `git checkout main && git pull`
 2. `pnpm version patch` (or `minor` / `major`). This:
-   - refuses unless you are on `main` and it matches `origin/main` (it fetches first);
+   - refuses unless you are on `main`, the working tree is clean (untracked files included,
+     since the `version` script's `git add -A` would commit them), and `main` matches
+     `origin/main` (it fetches first);
    - runs the app's build, then commits the bump and tags `vX.Y.Z` on a new
      `release/vX.Y.Z` branch, leaving local `main` untouched;
    - pushes the branch and tag and opens a "Release vX.Y.Z" PR with `gh`
