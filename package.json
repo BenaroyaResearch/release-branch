@@ -1,0 +1,27 @@
+{
+	"name": "@benaroyaresearch/release-branch",
+	"version": "1.0.0",
+	"description": "Cut, merge and publish releases of a branch-protected BRI app with `pnpm version` and `pnpm run release`.",
+	"type": "module",
+	"bin": {
+		"release-branch": "bin/release-branch.js"
+	},
+	"files": [
+		"bin"
+	],
+	"engines": {
+		"node": ">=22"
+	},
+	"scripts": {
+		"test": "node --check bin/release-branch.js && node --test"
+	},
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/BenaroyaResearch/release-branch.git"
+	},
+	"publishConfig": {
+		"registry": "https://npm.pkg.github.com"
+	},
+	"author": "BenaroyaResearch",
+	"license": "UNLICENSED"
+}
