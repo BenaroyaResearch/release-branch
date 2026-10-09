@@ -1,6 +1,6 @@
 {
 	"name": "@benaroyaresearch/release-branch",
-	"version": "1.1.0",
+	"version": "1.1.1",
 	"description": "Cut, merge and publish releases of a branch-protected BRI app with `pnpm version` and `pnpm run release`.",
 	"type": "module",
 	"bin": {
