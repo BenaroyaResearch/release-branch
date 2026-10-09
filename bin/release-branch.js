@@ -263,6 +263,9 @@ async function mergeWhenGreen(number, sha, name) {
 }
 
 // Anything but y/yes is a no, including Ctrl-D, Ctrl-C and having no terminal.
+// pnpm 12 runs the postversion hook with stdin on the terminal but stdout piped
+// through its reporter, which shows only whole lines, so there the question
+// ends in a newline. Without it nothing shows until Enter, which answers no.
 async function confirm(question) {
 	if (!process.stdin.isTTY) {
 		console.log('No terminal to confirm on, so not publishing.');
@@ -270,7 +273,8 @@ async function confirm(question) {
 	}
 	const prompt = createInterface({ input: process.stdin, output: process.stdout });
 	try {
-		return /^y(es)?$/i.test((await prompt.question(question)).trim());
+		const asked = process.stdout.isTTY ? question : `${question.trimEnd()}\n`;
+		return /^y(es)?$/i.test((await prompt.question(asked)).trim());
 	} catch {
 		return false;
 	} finally {
