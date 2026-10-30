@@ -1,11 +1,11 @@
 // Runs bin/release-branch.js against a throwaway origin (a bare repo on disk)
-// and a fake gh on PATH, so nothing here touches GitHub. The fake's `pr merge`
-// does a real --no-ff merge into the throwaway main. The interactive
-// confirmation is not exercised: with no terminal, `release` must never publish,
-// and that is what these tests check.
+// and a fake gh on PATH, so nothing here touches GitHub. The fake's `release
+// create` makes the tag on the throwaway origin at --target, as GitHub does.
+// The interactive confirmation is not exercised: with no terminal and no
+// --yes, `release` must never publish, and that is what these tests check.
 
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -17,31 +17,28 @@ const FAKE_GH = `#!/bin/sh
 echo "gh $*" >> "$GH_STATE/calls"
 case "$1 $2" in
   "--version "*) exit 0 ;;
-  "release view") [ -f "$GH_STATE/released" ] ;;
-  "release create") touch "$GH_STATE/released" ;;
-  "pr list") cat "$GH_STATE/pr.json" ;;
-  "pr view")
+  "run list")
     case "$*" in
-      *mergeStateStatus*) cat "$GH_STATE/view.json" ;;
-      *) exit 1 ;;
+      *"--event push"*) cat "$GH_STATE/runs.json" ;;
+      *) echo "https://example.test/runs/prod" ;;
     esac ;;
-  "pr create") exit 0 ;;
-  "pr checks") cat "$GH_STATE/checks.json"; exit "$(cat "$GH_STATE/checks.exit" 2>/dev/null || echo 0)" ;;
-  "pr merge")
-    cd "$GH_WORK" && git checkout --quiet main \
-      && git merge --quiet --no-ff -m "Merge pull request #1" release/v1.13.0 \
-      && git push --quiet origin main 2>/dev/null || exit 1
-    head=$(git rev-parse HEAD)
-    git checkout --quiet release/v1.13.0
-    printf '[{"number":1,"url":"https://example.test/pull/1","state":"MERGED","mergeCommit":{"oid":"%s"}}]' "$head" > "$GH_STATE/pr.json"
-    printf '{"state":"MERGED"}' > "$GH_STATE/view.json" ;;
-  "run list") echo "https://example.test/runs/1" ;;
+  "release create")
+    tag="$3"
+    target=""
+    while [ $# -gt 0 ]; do
+      [ "$1" = "--target" ] && target="$2"
+      shift
+    done
+    git -C "$GH_ORIGIN" tag "$tag" "$target" ;;
   *) echo "unexpected: gh $*" >&2; exit 2 ;;
 esac
 `;
 
-// origin with main at 1.12.0, and a pushed release/v1.13.0 branch carrying the
-// bump commit and its annotated tag, as `pnpm version minor` leaves them.
+const short = sha => sha.slice(0, 7);
+
+// origin's main: v1.12.0 (annotated, as 1.x's `npm version` made it), feature
+// A, feature B tagged v1.13.0 (lightweight, as `gh release create --target`
+// makes it), and feature C, not yet released. Every push run passed.
 function fixture() {
 	const root = mkdtempSync(join(tmpdir(), 'release-branch-'));
 	const origin = join(root, 'origin.git');
@@ -57,43 +54,28 @@ function fixture() {
 	execFileSync('git', ['clone', '--quiet', origin, work], { stdio: 'ignore' });
 	git('config', 'user.email', 'test@example.test');
 	git('config', 'user.name', 'test');
-	writeFileSync(join(work, 'package.json'), '{"version":"1.12.0"}\n');
-	git('add', '.');
-	git('commit', '--quiet', '-m', 'init');
-	git('push', '--quiet', 'origin', 'main');
-	git('checkout', '--quiet', '-b', 'release/v1.13.0');
-	writeFileSync(join(work, 'package.json'), '{"version":"1.13.0"}\n');
-	git('commit', '--quiet', '-am', '1.13.0');
-	git('tag', '-a', 'v1.13.0', '-m', 'v1.13.0');
-	git('push', '--quiet', 'origin', 'release/v1.13.0', 'refs/tags/v1.13.0');
-
-	const setPr = (prState, mergeCommit = null) => writeFileSync(join(state, 'pr.json'), JSON.stringify([{
-		number: 1, url: 'https://example.test/pull/1', state: prState, mergeCommit: mergeCommit && { oid: mergeCommit },
-	}]));
-	setPr('OPEN');
-	const bump = git('rev-parse', 'HEAD');
-	const setView = (fields = {}) => writeFileSync(join(state, 'view.json'), JSON.stringify({
-		state: 'OPEN', mergeStateStatus: 'CLEAN', headRefOid: bump, url: 'https://example.test/pull/1', ...fields,
-	}));
-	setView();
-	const setChecks = (checks, exitCode = 0) => {
-		writeFileSync(join(state, 'checks.json'), JSON.stringify(checks));
-		writeFileSync(join(state, 'checks.exit'), String(exitCode));
+	const commit = (file, message) => {
+		writeFileSync(join(work, file), `${message}\n`);
+		git('add', file);
+		git('commit', '--quiet', '-m', message);
+		return git('rev-parse', 'HEAD');
 	};
-	setChecks([{ name: 'ci / build', bucket: 'pass' }, { name: 'ci / warm-cache', bucket: 'skipping' }]);
+	const pushMain = () => git('push', '--quiet', 'origin', 'main');
 
-	const mergeToMain = (...mergeArgs) => {
-		git('checkout', '--quiet', 'main');
-		git('merge', '--quiet', ...mergeArgs, 'release/v1.13.0');
-		if (mergeArgs.includes('--squash')) git('commit', '--quiet', '-m', '1.13.0 (#1)');
-		git('push', '--quiet', 'origin', 'main');
-		const head = git('rev-parse', 'HEAD');
-		git('checkout', '--quiet', 'release/v1.13.0');
-		setPr('MERGED', head);
-		return head;
-	};
+	commit('README.md', 'init');
+	git('tag', '-a', 'v1.12.0', '-m', 'v1.12.0');
+	const featureA = commit('a.js', 'feature A');
+	const featureB = commit('b.js', 'feature B');
+	git('tag', 'v1.13.0');
+	const head = commit('c.js', 'feature C');
+	pushMain();
+	git('push', '--quiet', 'origin', 'refs/tags/v1.12.0', 'refs/tags/v1.13.0');
 
-	const env = { GH_STATE: state, GH_WORK: work, PATH: `${bin}:${process.env.PATH}` };
+	const setRuns = runs => writeFileSync(join(state, 'runs.json'), JSON.stringify(runs));
+	const passed = (workflowName, n) => ({ workflowName, status: 'completed', conclusion: 'success', url: `https://example.test/runs/${n}` });
+	setRuns([passed('stg', 1), passed('CodeQL', 2)]);
+
+	const env = { GH_STATE: state, GH_ORIGIN: origin, PATH: `${bin}:${process.env.PATH}` };
 	const runWith = (options, ...args) => spawnSync('node', [SCRIPT, ...args], {
 		cwd: work,
 		encoding: 'utf8',
@@ -102,200 +84,136 @@ function fixture() {
 		...options,
 	});
 	const run = (...args) => runWith({}, ...args);
-	const onMain = sha => {
-		git('fetch', '--quiet', 'origin', 'main');
-		return spawnSync('git', ['merge-base', '--is-ancestor', sha, 'origin/main'], { cwd: work }).status === 0;
-	};
-	const published = () => existsSync(join(state, 'released'));
 	const calls = () => (existsSync(join(state, 'calls')) ? readFileSync(join(state, 'calls'), 'utf8') : '');
+	const originTag = name => spawnSync('git', ['rev-parse', '--verify', '--quiet', `refs/tags/${name}^{commit}`], { cwd: origin, encoding: 'utf8' }).stdout.trim();
 
-	return { git, setPr, setView, setChecks, mergeToMain, run, runWith, published, calls, onMain, bump, env, work };
+	return { git, commit, pushMain, setRuns, passed, run, runWith, calls, originTag, featureA, featureB, head, work };
 }
 
-test('release refuses a tag that is not on origin', () => {
+test('a dry run names the next patch release of origin/main and publishes nothing', () => {
 	const f = fixture();
-	const r = f.run('release', 'v9.9.9');
-	assert.equal(r.status, 1);
-	assert.match(r.stderr, /v9\.9\.9 is not on origin/);
-});
-
-test('release refuses a tag that already has a GitHub release', () => {
-	const f = fixture();
-	f.mergeToMain('--no-ff', '-m', 'Merge PR');
-	writeFileSync(join(f.work, '..', 'state', 'released'), '');
-	const r = f.run('release');
-	assert.equal(r.status, 1);
-	assert.match(r.stderr, /already has a GitHub release/);
-});
-
-test('release stops when the PR was closed without merging', () => {
-	const f = fixture();
-	f.setPr('CLOSED');
-	const r = f.run('release');
-	assert.equal(r.status, 1);
-	assert.match(r.stderr, /closed without merging/);
-	assert.equal(f.published(), false);
-});
-
-test('release stops, with the re-tag command, when the PR was squashed', () => {
-	const f = fixture();
-	const squash = f.mergeToMain('--squash');
-	const r = f.run('release');
-	assert.equal(r.status, 1);
-	assert.match(r.stderr, /squashed or rebased/);
-	assert.ok(r.stderr.includes(`git tag -f v1.13.0 ${squash}`));
-	assert.equal(f.published(), false);
-});
-
-test('release never publishes without a terminal to confirm on', () => {
-	const f = fixture();
-	f.mergeToMain('--no-ff', '-m', 'Merge PR');
-	const r = f.run('release');
-	assert.equal(r.status, 0);
-	assert.match(r.stdout, /v1\.13\.0 \([0-9a-f]{7}\) is on main/);
-	assert.match(r.stdout, /No terminal to confirm on/);
-	assert.doesNotMatch(r.stdout, /NOT in the v1\.13\.0 image/);
-	assert.equal(f.published(), false);
+	const r = f.run('release', 'patch', '--dry-run');
+	assert.equal(r.status, 0, r.stderr);
+	assert.match(r.stdout, /Release v1\.13\.1 → production/);
+	assert.ok(r.stdout.includes(`commit    ${short(f.head)}  feature C`));
+	assert.match(r.stdout, /passed {4}stg, CodeQL, on its push to main/);
+	assert.match(r.stdout, /Dry run: nothing published/);
 	assert.doesNotMatch(f.calls(), /release create/);
 });
 
-test('release warns when main holds changes the tagged image does not', () => {
+test('minor, major and an explicit version count on from the highest tag', () => {
 	const f = fixture();
-	f.git('checkout', '--quiet', 'main');
-	writeFileSync(join(f.work, 'other.js'), '\n');
-	f.git('add', 'other.js');
-	f.git('commit', '--quiet', '-m', "someone else's PR");
-	f.git('push', '--quiet', 'origin', 'main');
-	f.git('checkout', '--quiet', 'release/v1.13.0');
-	f.git('merge', '--quiet', '--no-edit', 'main'); // the "Update branch" click
-	f.mergeToMain('--no-ff', '-m', 'Merge PR');
-	const r = f.run('release');
-	assert.match(r.stdout, /contains changes that are NOT in the v1\.13\.0 image/);
-	assert.equal(f.published(), false);
+	assert.match(f.run('release', 'minor', '--dry-run').stdout, /Release v1\.14\.0 /);
+	assert.match(f.run('release', 'major', '--dry-run').stdout, /Release v2\.0\.0 /);
+	assert.match(f.run('release', '1.20.0', '--dry-run').stdout, /Release v1\.20\.0 /);
+	assert.match(f.run('release', 'v1.20.1', '--dry-run').stdout, /Release v1\.20\.1 /);
 });
 
-test('check refuses to cut a release off main', () => {
+test('refuses a version that is not after the latest release', () => {
 	const f = fixture();
-	const r = f.run('check');
+	const r = f.run('release', '1.13.0', '--dry-run');
 	assert.equal(r.status, 1);
-	assert.match(r.stderr, /Releases are cut from main only/);
+	assert.match(r.stderr, /v1\.13\.0 is not after the latest release, v1\.13\.0/);
 });
 
-test('check refuses a main that is behind origin/main', () => {
+test('refuses a bump it does not know, and an option it does not know', () => {
 	const f = fixture();
-	f.mergeToMain('--no-ff', '-m', 'Merge PR');
-	f.git('checkout', '--quiet', 'main');
-	f.git('reset', '--quiet', '--hard', 'HEAD~1');
-	const r = f.run('check');
-	assert.equal(r.status, 1);
-	assert.match(r.stderr, /does not match origin\/main/);
+	const word = f.run('release', 'hotfix');
+	assert.equal(word.status, 1);
+	assert.match(word.stderr, /"hotfix" is not patch, minor, major or a version/);
+	const option = f.run('release', 'patch', '--no-merge');
+	assert.equal(option.status, 1);
+	assert.match(option.stderr, /Unknown option '--no-merge'/);
 });
 
-test('check passes on a clean main that matches origin/main', () => {
+test('lists the commits on main since the latest release', () => {
 	const f = fixture();
-	f.git('checkout', '--quiet', 'main');
-	const r = f.run('check');
+	f.commit('d.js', 'feature D');
+	f.pushMain();
+	const r = f.run('release', 'patch', '--dry-run');
 	assert.equal(r.status, 0, r.stderr);
+	assert.match(r.stdout, /since {5}v1\.13\.0:\n {12}\w+ feature D\n {12}\w+ feature C\n/);
+	assert.doesNotMatch(r.stdout, /feature B/);
 });
 
-test('check refuses an untracked file, which `git add -A` would commit', () => {
+test('refuses a commit that is already released', () => {
 	const f = fixture();
-	f.git('checkout', '--quiet', 'main');
-	execFileSync('mkdir', ['-p', join(f.work, 'notes')]);
-	writeFileSync(join(f.work, 'notes', 'scratch.txt'), 'wip\n');
-	const r = f.run('check');
+	const r = f.run('release', 'patch', '--target', f.featureB, '--dry-run');
 	assert.equal(r.status, 1);
-	assert.match(r.stderr, /working tree is not clean/);
-	assert.match(r.stderr, /\?\? notes\/scratch\.txt/); // the file, not just its directory
+	assert.match(r.stderr, /already released, as v1\.13\.0/);
 });
 
-test('check refuses a modified tracked file', () => {
+test('refuses a commit with exactly the files of the latest release', () => {
 	const f = fixture();
-	f.git('checkout', '--quiet', 'main');
-	writeFileSync(join(f.work, 'package.json'), '{"version":"1.12.0","edited":true}\n');
-	const r = f.run('check');
+	f.git('revert', '--no-edit', 'HEAD');
+	f.pushMain();
+	const r = f.run('release', 'patch', '--dry-run');
 	assert.equal(r.status, 1);
-	assert.match(r.stderr, / M package\.json/);
+	assert.match(r.stderr, /Nothing to release: \w+ holds exactly the files v1\.13\.0 does/);
 });
 
-test('check ignores gitignored files, such as build output', () => {
+test('refuses a commit that is not on main', () => {
 	const f = fixture();
-	f.git('checkout', '--quiet', 'main');
-	writeFileSync(join(f.work, '.gitignore'), 'dist/\n');
-	f.git('add', '.gitignore');
-	f.git('commit', '--quiet', '-m', 'ignore dist');
-	f.git('push', '--quiet', 'origin', 'main');
-	execFileSync('mkdir', ['-p', join(f.work, 'dist')]);
-	writeFileSync(join(f.work, 'dist', 'bundle.js'), '\n');
-	const r = f.run('check');
+	f.git('switch', '--quiet', '-c', 'side');
+	const side = f.commit('side.js', 'side work');
+	const r = f.run('release', 'patch', '--target', side, '--dry-run');
+	assert.equal(r.status, 1);
+	assert.match(r.stderr, /is not on main, and the prod workflow only releases commits on main/);
+});
+
+test('warns when the commit is older than the latest release', () => {
+	const f = fixture();
+	const r = f.run('release', 'patch', '--target', f.featureA, '--dry-run');
 	assert.equal(r.status, 0, r.stderr);
+	assert.match(r.stdout, /does not contain v1\.13\.0 \(\w+\): releasing it takes production back to older code/);
 });
 
-test('release merges the PR with a merge commit once every check passes', () => {
+test('refuses when a workflow on that push did not pass', () => {
 	const f = fixture();
-	const r = f.run('release');
-	assert.equal(r.status, 0, r.stderr);
-	assert.match(r.stdout, /All 2 checks on \S+ passed/);
-	assert.ok(f.calls().includes(`gh pr merge 1 --merge --match-head-commit ${f.bump}`));
-	assert.ok(f.onMain(f.bump), 'the tagged commit is on main');
-	assert.match(r.stdout, /No terminal to confirm on/);
-	assert.equal(f.published(), false);
-});
-
-test('release does not merge while a check has failed', () => {
-	const f = fixture();
-	f.setChecks([{ name: 'ci / build', bucket: 'pass' }, { name: 'test / Jest', bucket: 'fail' }], 1);
-	const r = f.run('release');
+	f.setRuns([f.passed('CodeQL', 2), { workflowName: 'stg', status: 'completed', conclusion: 'failure', url: 'https://example.test/runs/1' }]);
+	const r = f.run('release', 'patch', '--yes');
 	assert.equal(r.status, 1);
-	assert.match(r.stderr, /Not merging \S+: test \/ Jest did not pass/);
-	assert.doesNotMatch(f.calls(), /pr merge/);
-	assert.equal(f.onMain(f.bump), false);
+	assert.match(r.stderr, /Not releasing \w+: stg ended failure \(https:\/\/example\.test\/runs\/1\)/);
+	assert.doesNotMatch(f.calls(), /release create/);
 });
 
-test('release does not merge a PR that is behind main, and says how to re-cut', () => {
+test('waits while a workflow on that push is still running', () => {
 	const f = fixture();
-	f.setView({ mergeStateStatus: 'BEHIND' });
-	const r = f.run('release');
-	assert.equal(r.status, 1);
-	assert.match(r.stderr, /is behind it/);
-	assert.match(r.stderr, /git tag -d v1\.13\.0 && git push origin :refs\/tags\/v1\.13\.0/);
-	assert.doesNotMatch(f.calls(), /pr merge/);
-});
-
-test('release does not merge a PR with a commit after the bump', () => {
-	const f = fixture();
-	f.setView({ headRefOid: '0123456789abcdef0123456789abcdef01234567' });
-	const r = f.run('release');
-	assert.equal(r.status, 1);
-	assert.match(r.stderr, /has a commit after the v1\.13\.0 bump/);
-	assert.doesNotMatch(f.calls(), /pr merge/);
-});
-
-test('release --no-merge leaves an open PR for a person to merge', () => {
-	const f = fixture();
-	const r = f.runWith({ timeout: 3000 }, 'release', '--no-merge');
+	f.setRuns([{ workflowName: 'stg', status: 'in_progress', conclusion: '', url: 'https://example.test/runs/1' }]);
+	const r = f.runWith({ timeout: 3000 }, 'release', 'patch', '--yes');
 	assert.equal(r.status, null, 'still waiting when the timeout stopped it');
-	assert.match(r.stdout, /Waiting for \S+ to merge into main/);
-	assert.doesNotMatch(f.calls(), /pr merge/);
+	assert.match(r.stdout, /Waiting for stg on \w{7}/);
+	assert.doesNotMatch(f.calls(), /release create/);
 });
 
-test('publish opens the PR and carries on into release', () => {
+test('never publishes without a terminal to confirm on', () => {
 	const f = fixture();
-	const r = f.run('publish');
+	const r = f.run('release', 'patch');
 	assert.equal(r.status, 0, r.stderr);
-	const calls = f.calls();
-	assert.ok(calls.indexOf('gh pr create') !== -1, 'opened the PR');
-	assert.ok(calls.indexOf('gh pr merge') > calls.indexOf('gh pr create'), 'merged after opening it');
-	assert.ok(f.onMain(f.bump));
-	assert.equal(f.published(), false);
+	assert.match(r.stdout, /No terminal to confirm on/);
+	assert.doesNotMatch(f.calls(), /release create/);
+	assert.equal(f.originTag('v1.13.1'), '');
 });
 
-test('RELEASE_BRANCH_NO_MERGE=1 makes publish stop once the PR is open', () => {
+test('--yes publishes the release on that commit and prints the prod run', () => {
 	const f = fixture();
-	const r = f.runWith({ env: { ...process.env, ...f.env, RELEASE_BRANCH_NO_MERGE: '1' } }, 'publish');
+	const r = f.run('release', 'patch', '--yes');
 	assert.equal(r.status, 0, r.stderr);
-	assert.match(r.stdout, /RELEASE_BRANCH_NO_MERGE is set/);
-	assert.match(f.calls(), /gh pr create/);
-	assert.doesNotMatch(f.calls(), /pr merge|pr checks/);
-	assert.equal(f.onMain(f.bump), false);
+	assert.ok(f.calls().includes(`gh release create v1.13.1 --target ${f.head} --title v1.13.1 --generate-notes`));
+	assert.equal(f.originTag('v1.13.1'), f.head);
+	assert.match(r.stdout, /Production deploy: https:\/\/example\.test\/runs\/prod/);
+
+	const again = f.run('release', 'patch', '--yes');
+	assert.equal(again.status, 1);
+	assert.match(again.stderr, /already released, as v1\.13\.1/);
+});
+
+test("1.x's pnpm version hooks stop it before anything is bumped, with the steps to move over", () => {
+	const f = fixture();
+	['check', 'branch', 'publish'].forEach(mode => {
+		const r = f.run(mode);
+		assert.equal(r.status, 1);
+		assert.match(r.stderr, /release-branch 2 releases by tagging a commit main already built/);
+		assert.match(r.stderr, /remove the preversion, version and postversion scripts/);
+	});
 });

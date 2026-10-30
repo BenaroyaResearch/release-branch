@@ -1,100 +1,122 @@
 # @benaroyaresearch/release-branch
 
-Releases for BRI Node apps whose `main` is branch-protected. `pnpm version`
-can no longer push its bump commit straight to `main`, so this puts the bump on
-a `release/vX.Y.Z` branch, opens the PR, merges it with a merge commit once
-every check passes, and then asks before publishing the GitHub release that
-deploys to production.
+Releases for BRI Node apps that build their image once, on the pull request,
+and promote it by retag. A release is a tag on a commit `main` has already
+built and deployed to staging: `pnpm run release patch` picks the next version,
+checks that commit's pipelines passed, asks, and publishes the GitHub release
+that deploys it to production. Nothing is committed, so there is no release
+branch, no release PR, no new image, and `main` does not move.
+
+The version is the tag, not `package.json`'s `version`. The image is built
+before anyone has decided its release number, so the app reads the number at
+runtime from `APP_VERSION`, which Flux keeps equal to the deployment's image
+tag. See [What an app needs](#what-an-app-needs).
 
 Written by Robyn for LiteratureDB, and packaged so every swcore app runs the
-same copy.
+same copy. 1.x put the version bump on a `release/vX.Y.Z` branch and merged it
+through a PR, hence the name.
 
 ## Releasing
 
-One command takes a release from `main` to the production prompt:
-
-1. `git checkout main && git pull`
-2. `pnpm version patch` (or `minor` / `major`). This:
-   - refuses unless you are on `main`, the working tree is clean (untracked files included,
-     since the `version` script's `git add -A` would commit them), and `main` matches
-     `origin/main` (it fetches first);
-   - runs the app's build, then commits the bump and tags `vX.Y.Z` on a new
-     `release/vX.Y.Z` branch, leaving local `main` untouched;
-   - pushes the branch and tag and opens a "Release vX.Y.Z" PR with `gh`;
-   - waits for **every** check on that PR, the staging deploy of the release
-     image included, checking every 30 seconds;
-   - **merges it with a merge commit** once they all pass (`gh pr merge --merge
-     --match-head-commit`), so the tagged commit lands on `main`. It does not
-     merge if a check failed, if `main` moved since the release was cut, or if
-     anything was pushed on top of the bump; it stops and says what to do;
-   - checks the tagged commit is on `main`, and warns if `main` holds changes
-     the release image lacks;
-   - **asks before publishing**, because from there on it is a production
-     deploy, then creates the GitHub release from the existing tag with
-     generated notes and prints the prod workflow run.
-
-Stopping it is safe at any point, Ctrl-C included, and so is answering no at
-the prompt. `pnpm run release` picks up from wherever it stopped: waiting for
-checks, merging, or publishing.
-
-If `gh` cannot merge the PR (a required review, say), it says so and waits for
-you to merge it on GitHub, with a merge commit, then carries on. To have it
-never merge, and only wait for someone else to, use
-`pnpm run release --no-merge`, or set `RELEASE_BRANCH_NO_MERGE=1`, which also
-reaches `pnpm version`'s hooks: `publish` then stops once the PR is open. The
-bri-cicd plugin's `node-release` skill sets it, because Claude confirms the
-merge with you in chat.
-
-Pass a tag to release one from another branch: `pnpm run release v1.13.0`.
-
-If `main` moves while the release PR is open, GitHub marks it out of date and
-`pnpm version` stops rather than merge. Do not click "Update branch": that adds
-a commit after the tag, so production would get an image without it. Instead,
-close the PR, delete its tag and branch, and cut the release again from the new
-`main`:
-
 ```bash
-git checkout main && git pull
-git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z
-git branch -D release/vX.Y.Z && git push origin :release/vX.Y.Z
-pnpm version minor   # the same bump as before
+pnpm run release patch     # or minor, major, or a version such as 1.14.0
 ```
 
-## Adding it to an app
+It reads `origin`, not your working tree, so any checkout on any branch will
+do. It:
 
-```bash
-pnpm add -D @benaroyaresearch/release-branch
-```
+- fetches `main` and takes its head, or the commit `--target <sha>` names,
+  which must be on `main` because the prod workflow refuses anything else;
+- names the release after the highest `vX.Y.Z` tag on `origin`, bumped, and
+  refuses a version that is not after it;
+- refuses a commit that is already released, or that holds exactly the files
+  the latest release does;
+- waits for every workflow that commit's push to `main` started, checking every
+  30 seconds, and refuses if one did not pass. On a build-once app that is
+  `stg`, whose retag made the `sha-<commit>` image the prod workflow promotes
+  and whose rollout check verified it in staging. Pull request, scheduled and
+  Dependabot runs do not count;
+- lists the commits on `main` since the latest release, then **asks before
+  publishing**, because from there on it is a production deploy;
+- creates the GitHub release with generated notes (`gh release create vX.Y.Z
+  --target <sha>`), which makes the tag, and prints the prod workflow run.
 
-Then wire the hooks in the app's `package.json`, keeping whatever build its
-`version` script already runs:
+Nothing is written before the release is created, so Ctrl-C, or answering no,
+leaves nothing to clean up.
 
-```json
-"scripts": {
-  "preversion": "release-branch check",
-  "version": "pnpm run build && release-branch branch && git add -A",
-  "postversion": "release-branch publish",
-  "release": "release-branch release"
-}
-```
+`--dry-run` stops before the question. `--yes` publishes without asking, for a
+caller that has already confirmed, such as an agent; pass it with
+`--target <the SHA a dry run showed>`, so the commit cannot change in between.
+
+Releasing a commit older than the latest release works, and is how to roll
+production back: it warns that production goes back to older code.
+
+## What an app needs
+
+1. **The version from the deployment.** In each fluxcd overlay, an env var set
+   by the same image policy as `image:`, through the `:tag` marker:
+
+   ```yaml
+   - name: myapp
+     image: ghcr.io/benaroyaresearch/myapp:1.4.2 # {"$imagepolicy": "flux-system:myapp"}
+     env:
+       - name: APP_VERSION
+         value: "1.4.2" # {"$imagepolicy": "flux-system:myapp:tag"}
+   ```
+
+   fluxcdbot then moves both in one commit: the release's semver in
+   production, `staging-<sha>-<ts>` in staging. The app reads
+   `process.env.APP_VERSION` wherever it showed `package.json`'s version. A
+   client bundle cannot hold it, since the bundle is built with the image:
+   serve it from the server.
+2. **The package and one script**, with `version` left at `0.0.0` so nobody
+   mistakes it for the release:
+
+   ```bash
+   pnpm add -D @benaroyaresearch/release-branch
+   ```
+
+   ```json
+   "version": "0.0.0",
+   "scripts": {
+     "release": "release-branch release"
+   }
+   ```
+
+3. **"Require branches to be up to date before merging" on `main`**, which the
+   ci-pipeline skill sets up. With no release PR, nothing re-tests `main`
+   before production; that rule is what makes every commit on `main` a tree a
+   pull request fully tested.
 
 The app's committed `.npmrc` already routes `@benaroyaresearch` to GitHub
 Packages, and developers' `~/.npmrc` already carries the token, because every
 swcore app installs `@benaroyaresearch/bri-react-components`. The package is
 public, so an app's CI and image build can install it with no access grant.
 
-`publish` and `release` need the [GitHub CLI](https://cli.github.com/),
-signed in (`gh auth login`). Without it, `pnpm version` pushes the branch and
-tag, prints a link to open the PR, and stops; merge it with a merge commit and
-publish the release from the existing tag on GitHub.
+`release` needs the [GitHub CLI](https://cli.github.com/), signed in
+(`gh auth login`).
+
+## Moving from 1.x
+
+1. Merge the fluxcd overlay change and the app's `APP_VERSION` change above,
+   then check that staging's version reads `staging-<sha>-<ts>`. A 1.x release
+   still works at this point, and production then reads its semver.
+2. In `package.json`, remove the `preversion`, `version` and `postversion`
+   scripts, keep `"release": "release-branch release"`, set `version` to
+   `0.0.0`, and upgrade:
+   `pnpm add -D @benaroyaresearch/release-branch@^2`.
+
+The first 2.x release counts on from the last 1.x tag. Until step 2, 2.x
+refuses to run from 1.x's hooks, so `pnpm version` stops before it bumps
+anything and prints these steps.
 
 ## Changing this package
 
-`npm test` runs every mode against a throwaway origin repo and a fake `gh`, so
-nothing touches GitHub. The fake's `pr merge` does a real `--no-ff` merge into
-the throwaway `main`. The interactive confirmation is not covered by the
-tests: with no terminal, `release` must never publish, and that is what they
-check.
+`npm test` runs `release` against a throwaway origin repo and a fake `gh`, so
+nothing touches GitHub. The fake's `release create` makes the tag on the
+throwaway origin at `--target`, as GitHub does. The interactive confirmation is
+not covered by the tests: with no terminal and no `--yes`, `release` must never
+publish, and that is what they check.
 
 To publish a new version: bump `version` in `package.json` in a PR, merge it,
 then publish a GitHub release tagged `v<that version>`. The publish workflow
