@@ -6,7 +6,7 @@
 // release needs no bump commit, no branch, no PR and no new image.
 //
 //   release-branch release <patch|minor|major|X.Y.Z> [--target <sha>] [--dry-run] [--yes]
-//     (`pnpm run release patch`)
+//     (`pnpm release patch`)
 //     Take origin/main's head, or --target, which must be on main. Name it
 //     after the highest vX.Y.Z tag on origin, bumped. Wait for every workflow
 //     its push to main started, stg's retag and rollout check included, and
@@ -17,27 +17,22 @@
 //     confirmed, such as an agent. Nothing is written before the release is
 //     created, so stopping at any point before that is safe.
 //
-//   release-branch version   (from the "version" hook)
-//   release-branch publish   (from the "postversion" hook)
-//     So that `pnpm version patch` (or minor, major, a version) releases the
-//     same way. pnpm always commits and tags the bump, and tells its hooks
-//     only the version it wrote, so publish undoes the commit and tag, reads
-//     the bump back from that version and runs `release` with it. The version
-//     hook runs before pnpm commits: it notes the commit pnpm starts from, and
-//     moves aside a local tag of the name pnpm is about to give its own (from
-//     0.0.0, a major is v1.0.0), which would stop pnpm before publish runs.
+//   release-branch check   (from the "preversion" hook)
+//     Stop `pnpm version` before it writes anything, and say to run `release`
+//     instead. pnpm version commits and tags a bump locally and takes no
+//     options, so it cannot release this way.
 //
 // The name is from 1.x, which committed the bump to a release/vX.Y.Z branch and
-// merged it through a PR. Its check and branch modes now fail with the steps to
-// move an app over.
+// merged it through a PR. 1.x's branch and publish hooks, and 2.1's version and
+// publish hooks, stop pnpm version too, undoing what they can of its bump, and
+// say how to move the app over.
 
 import { execFileSync } from 'node:child_process';
 import { once } from 'node:events';
-import { openSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline/promises';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { WriteStream } from 'node:tty';
-import { format, parseArgs } from 'node:util';
+import { parseArgs } from 'node:util';
 
 const BASE = 'main';
 const POLL_MS = 30_000;
@@ -46,18 +41,10 @@ const SEMVER = /^v?(\d+)\.(\d+)\.(\d+)$/;
 // image was not built, or not verified in staging.
 const PASSED = new Set(['success', 'skipped', 'neutral']);
 const USAGE = 'usage: release-branch release <patch|minor|major|X.Y.Z> [--target <sha>] [--dry-run] [--yes]';
-// What the version hook leaves for publish: the commit pnpm bumps on top of,
-// and the local tags moved out of pnpm's way.
-const BASE_REF = 'refs/release-branch/base';
-const ASIDE = 'refs/release-branch/aside/';
-
-// Where the output goes: stdout, or the terminal itself (see writeToTerminal).
-let out = process.stdout;
-let terminalFd = null;
 
 const run = (cmd, args) => execFileSync(cmd, args, { encoding: 'utf8' }).trim();
 const git = (...args) => run('git', args);
-const passthrough = (cmd, args) => execFileSync(cmd, args, { stdio: terminalFd === null ? 'inherit' : ['inherit', terminalFd, terminalFd] });
+const passthrough = (cmd, args) => execFileSync(cmd, args, { stdio: 'inherit' });
 const succeeds = (cmd, args) => {
 	try {
 		execFileSync(cmd, args, { stdio: 'ignore' });
@@ -177,7 +164,7 @@ function changesSince(from, sha) {
 }
 
 // Anything but y/yes is a no, including Ctrl-D, Ctrl-C and having no terminal.
-// Output piped through pnpm 12's reporter shows only whole lines, so there the
+// With stdout piped, through a reporter that shows only whole lines, the
 // question ends in a newline. Without it nothing shows until Enter, which
 // answers no.
 async function confirm(question) {
@@ -185,9 +172,9 @@ async function confirm(question) {
 		console.log('No terminal to confirm on, so not publishing.');
 		return false;
 	}
-	const prompt = createInterface({ input: process.stdin, output: out });
+	const prompt = createInterface({ input: process.stdin, output: process.stdout });
 	try {
-		const asked = out.isTTY ? question : `${question.trimEnd()}\n`;
+		const asked = process.stdout.isTTY ? question : `${question.trimEnd()}\n`;
 		// Ctrl-D closes the prompt without ever settling question().
 		const answer = await Promise.race([prompt.question(asked), once(prompt, 'close').then(() => '')]);
 		return /^y(es)?$/i.test(answer.trim());
@@ -215,7 +202,7 @@ async function findProdRun(sha) {
 	return `https://github.com/${repoSlug()}/actions/workflows/prod.yaml`;
 }
 
-async function release(args, rerun = 'pnpm run release') {
+async function release(args) {
 	let parsed;
 	try {
 		parsed = parseArgs({
@@ -271,7 +258,7 @@ async function release(args, rerun = 'pnpm run release') {
 		return;
 	}
 	if (!values.yes && !await confirm(`Publish ${name} and deploy it to production? [y/N] `)) {
-		console.log(`\nNot published. Rerun \`${rerun} ${wanted}\` when you are ready.\n`);
+		console.log(`\nNot published. Rerun \`pnpm release ${wanted}\` when you are ready.\n`);
 		return;
 	}
 	// gh ignores --target for a tag that already exists and releases whatever it
@@ -282,111 +269,48 @@ async function release(args, rerun = 'pnpm run release') {
 	console.log(`\nProduction deploy: ${await findProdRun(sha)}\n`);
 }
 
-const hasRef = ref => succeeds('git', ['rev-parse', '--verify', '--quiet', ref]);
-// The app's package.json (lifecycle scripts start in the package root).
-const manifestVersion = () => JSON.parse(readFileSync('package.json', 'utf8')).version;
+const GUIDE = 'https://github.com/BenaroyaResearch/release-branch';
+const manifest = () => JSON.parse(readFileSync('package.json', 'utf8'));
 
-// The bump pnpm was given, from the version it wrote over `from`: pnpm 12 tells
-// its hooks nothing else. From 0.0.0, 0.0.1 is a patch, 0.1.0 a minor and 1.0.0
-// a major; any other version was given as one.
-const bumpGiven = (from, to) => (SEMVER.test(from) && ['patch', 'minor', 'major'].find(word => nextVersion(from, word) === `v${to}`)) || to;
-
-// Put back the tags the version hook moved aside, over pnpm's tag of the same
-// name if it is still there: the one moved aside is the clone's copy of a real
-// release.
-function restoreAside() {
-	git('for-each-ref', '--format=%(refname)', ASIDE).split('\n').filter(Boolean).forEach(ref => {
-		git('update-ref', `refs/tags/${ref.slice(ASIDE.length)}`, git('rev-parse', ref));
-		git('update-ref', '-d', ref);
-	});
+// The version hooks (1.x's branch, 2.1's version) run after pnpm writes the new
+// version, before it commits. Put package.json back, unless pnpm's version is
+// not all that differs from the committed one.
+function undoManifest() {
+	const committed = JSON.parse(git('show', 'HEAD:./package.json'));
+	if (JSON.stringify({ ...manifest(), version: committed.version }) !== JSON.stringify(committed)) return false;
+	git('checkout', 'HEAD', '--', 'package.json');
+	return true;
 }
 
-// The "version" hook: pnpm has written the new version and commits and tags it
-// next. If this clone already has a tag of that name, from an old release,
-// pnpm's `git tag` fails after the commit and publish never runs.
-function version() {
-	restoreAside();
-	git('update-ref', BASE_REF, 'HEAD');
-	const tag = `v${manifestVersion()}`;
-	if (hasRef(`refs/tags/${tag}`)) {
-		git('update-ref', `${ASIDE}${tag}`, git('rev-parse', `refs/tags/${tag}`));
-		git('update-ref', '-d', `refs/tags/${tag}`);
-	}
-}
-
-// pnpm's bump commit is the one on top of where the version hook noted it
-// started, and every tag on that commit is pnpm's. With --no-git-tag-version
-// there is no commit, only the new version in package.json.
-function undoBump(bumped) {
-	if (!hasRef(BASE_REF)) {
-		fail(`release-branch publish needs "version": "release-branch version" beside it in package.json. Nothing was released; to undo pnpm's ${bumped} bump, if it committed one:\n   git tag -d v${bumped} && git reset --keep HEAD^`);
-	}
-	const base = git('rev-parse', BASE_REF);
-	const head = git('rev-parse', 'HEAD');
-	if (head !== base && hasRef(`${head}^`) && git('rev-parse', `${head}^`) === base) {
-		git('tag', '--points-at', head).split('\n').filter(Boolean).forEach(name => git('tag', '-d', name));
-		git('reset', '--quiet', '--keep', base);
-	} else if (head === base) {
-		git('checkout', 'HEAD', '--', 'package.json');
+// `pnpm version` commits and tags a bump locally, tells its hooks only the
+// version it wrote, takes no options, and folds its hooks' output into a box,
+// so it does not release. Every release-branch hook stops it, and says what to
+// run instead and what is left of pnpm's bump. A failing hook stops pnpm before
+// the next step: preversion before it writes anything, version before it
+// commits; by postversion it has committed and tagged. pnpm shows the message
+// in a box that cuts lines at the terminal's width, hence the short lines.
+function refuseVersion(hook) {
+	const { version, scripts = {} } = manifest();
+	const lines = ['`pnpm version` does not release: run `pnpm release patch` instead', '(or minor, major, or a version such as 1.14.0).'];
+	if (hook === 'check') {
+		lines.push('Nothing was bumped.');
+	} else if (hook === 'publish') {
+		lines.push(`pnpm committed and tagged a bump to ${version}. Undo both with:`, `git tag -d v${version} && git reset --keep HEAD^`);
+	} else if (undoManifest()) {
+		lines.push(`pnpm's bump of package.json to ${version} is undone; nothing was committed.`);
 	} else {
-		restoreAside();
-		fail(`HEAD (${short(head)}) is not pnpm's bump on top of ${short(base)}, so it is left alone and nothing was released.`);
+		lines.push(`pnpm bumped package.json to ${version} and committed nothing: undo it by hand.`);
 	}
-	git('update-ref', '-d', BASE_REF);
-	restoreAside();
-}
-
-// pnpm 12 pipes a hook's output into a live box on the terminal, which folds
-// all but its last lines into "[N lines collapsed]" and keeps "Running..."
-// under the question while it waits for the answer. So with a terminal there,
-// write to the terminal directly, below the box: pnpm leaves the screen alone
-// until the hook exits, then moves up a line and writes "Done" (or "Failed").
-// Clear pnpm's "Running..." line first, and that last line is the blank line
-// every exit here ends with. Without a terminal, pnpm's output is plain lines.
-function writeToTerminal() {
-	if (!process.stdin.isTTY || process.stdout.isTTY) return;
-	try {
-		terminalFd = openSync('/dev/tty', 'w');
-	} catch {
-		return;
+	if (/release-branch branch/.test(scripts.version ?? '')) {
+		lines.push('This app is still wired for release-branch 1. To move it over, see', `${GUIDE}#moving-from-1x`);
+	} else if (/release-branch/.test(`${scripts.version ?? ''} ${scripts.postversion ?? ''}`)) {
+		lines.push('In package.json, replace the "version" and "postversion" scripts', 'with "preversion": "release-branch check".');
 	}
-	out = new WriteStream(terminalFd);
-	let clear = '\x1b[1A\x1b[2K';
-	console.log = (...args) => {
-		out.write(`${clear}${format(...args)}\n`);
-		clear = '';
-	};
-	console.error = console.log;
+	fail(lines.join('\n   '));
 }
-
-// The "postversion" hook. Once pnpm's bump is undone there is nothing local to
-// clean up, so it can stop anywhere, like `release`. When the hook succeeds,
-// pnpm goes on to print "Version bumped successfully" with the bump it made,
-// and nothing a hook does stops that (a failing hook prints an error instead),
-// so the last lines here say what that is, short enough not to wrap.
-async function publish() {
-	writeToTerminal();
-	const bumped = manifestVersion();
-	undoBump(bumped);
-	const from = manifestVersion();
-	await release([bumpGiven(from, bumped)], 'pnpm version');
-	console.log(`Ignore pnpm's "${from} → ${bumped}" below: that bump was local and is undone,`);
-	console.log(`and package.json is still ${from}.\n`);
-}
-
-// 1.x's pnpm version hooks, in an app that has not moved over. Failing in
-// `check`, the preversion hook, stops pnpm version before it bumps anything.
-const MOVED = [
-	`release-branch 2 releases by tagging a commit ${BASE} already built: no version bump, branch or PR.`,
-	'   In package.json, set "version" to "0.0.0", remove the preversion script, and set',
-	'   "version": "release-branch version" and "postversion": "release-branch publish".',
-	'   See https://github.com/BenaroyaResearch/release-branch#moving-from-1x',
-].join('\n');
 
 const mode = process.argv[2];
 if (mode === 'release') await release(process.argv.slice(3));
-else if (mode === 'version') version();
-else if (mode === 'publish') await publish();
-else if (['check', 'branch'].includes(mode)) fail(MOVED);
+else if (['check', 'branch', 'version', 'publish'].includes(mode)) refuseVersion(mode);
 else fail(USAGE);
 /* eslint-enable no-console */
