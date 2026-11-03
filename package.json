@@ -1,7 +1,7 @@
 {
 	"name": "@benaroyaresearch/release-branch",
-	"version": "2.0.0",
-	"description": "Release a BRI app by tagging a commit main already built and staged, with `pnpm run release`.",
+	"version": "2.1.0",
+	"description": "Release a BRI app by tagging a commit main already built and staged, with `pnpm version patch`.",
 	"type": "module",
 	"bin": {
 		"release-branch": "bin/release-branch.js"

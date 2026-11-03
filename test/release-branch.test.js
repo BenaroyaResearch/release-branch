@@ -1,8 +1,9 @@
 // Runs bin/release-branch.js against a throwaway origin (a bare repo on disk)
 // and a fake gh on PATH, so nothing here touches GitHub. The fake's `release
 // create` makes the tag on the throwaway origin at --target, as GitHub does.
-// The interactive confirmation is not exercised: with no terminal and no
-// --yes, `release` must never publish, and that is what these tests check.
+// pnpmVersion stands in for pnpm 12 running the version hooks. The interactive
+// confirmation is not exercised: with no terminal and no --yes, `release` must
+// never publish, and that is what these tests check.
 
 import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
@@ -62,6 +63,9 @@ function fixture() {
 	};
 	const pushMain = () => git('push', '--quiet', 'origin', 'main');
 
+	const manifest = join(work, 'package.json');
+	writeFileSync(manifest, '{\n\t"name": "app",\n\t"version": "0.0.0"\n}\n');
+	git('add', 'package.json');
 	commit('README.md', 'init');
 	git('tag', '-a', 'v1.12.0', '-m', 'v1.12.0');
 	const featureA = commit('a.js', 'feature A');
@@ -86,8 +90,27 @@ function fixture() {
 	const run = (...args) => runWith({}, ...args);
 	const calls = () => (existsSync(join(state, 'calls')) ? readFileSync(join(state, 'calls'), 'utf8') : '');
 	const originTag = name => spawnSync('git', ['rev-parse', '--verify', '--quiet', `refs/tags/${name}^{commit}`], { cwd: origin, encoding: 'utf8' }).stdout.trim();
+	const localRef = ref => spawnSync('git', ['rev-parse', '--verify', '--quiet', ref], { cwd: work, encoding: 'utf8' }).stdout.trim();
+	const manifestVersion = () => JSON.parse(readFileSync(manifest, 'utf8')).version;
 
-	return { git, commit, pushMain, setRuns, passed, run, runWith, calls, originTag, featureA, featureB, head, work };
+	// What pnpm 12's `pnpm version` does around the hooks: write the new
+	// version, run "version", commit and tag it (not with --no-git-tag-version),
+	// then run "postversion".
+	const pnpmVersion = (version, { gitTagVersion = true, versionHook = true } = {}) => {
+		writeFileSync(manifest, readFileSync(manifest, 'utf8').replace(/"version": "[^"]*"/, `"version": "${version}"`));
+		if (versionHook) {
+			const hook = run('version');
+			if (hook.status !== 0) return hook;
+		}
+		if (gitTagVersion) {
+			git('add', 'package.json');
+			git('commit', '--quiet', '-m', version);
+			git('tag', '-a', `v${version}`, '-m', version);
+		}
+		return run('publish');
+	};
+
+	return { git, commit, pushMain, setRuns, passed, run, runWith, calls, originTag, localRef, manifestVersion, pnpmVersion, featureA, featureB, head, work };
 }
 
 test('a dry run names the next patch release of origin/main and publishes nothing', () => {
@@ -208,12 +231,80 @@ test('--yes publishes the release on that commit and prints the prod run', () =>
 	assert.match(again.stderr, /already released, as v1\.13\.1/);
 });
 
+test('pnpm version patch releases the next patch and leaves no bump behind', () => {
+	const f = fixture();
+	const r = f.pnpmVersion('0.0.1');
+	assert.equal(r.status, 0, r.stderr);
+	assert.match(r.stdout, /Release v1\.13\.1 → production/);
+	assert.match(r.stdout, /No terminal to confirm on/);
+	assert.match(r.stdout, /Rerun `pnpm version patch`/);
+	assert.match(r.stdout, /Ignore pnpm's "0\.0\.0 → 0\.0\.1" below: that bump was local and is undone,\nand package\.json is still 0\.0\.0\.\n+$/);
+	assert.doesNotMatch(f.calls(), /release create/);
+	assert.equal(f.git('rev-parse', 'HEAD'), f.head);
+	assert.equal(f.git('status', '--porcelain'), '');
+	assert.equal(f.manifestVersion(), '0.0.0');
+	assert.equal(f.localRef('refs/tags/v0.0.1'), '');
+	assert.equal(f.git('for-each-ref', 'refs/release-branch'), '');
+});
+
+test('pnpm version minor, major and a version count on from the highest tag on origin', () => {
+	const f = fixture();
+	assert.match(f.pnpmVersion('0.1.0').stdout, /Release v1\.14\.0 /);
+	assert.match(f.pnpmVersion('1.0.0').stdout, /Release v2\.0\.0 /);
+	const explicit = f.pnpmVersion('1.20.0');
+	assert.match(explicit.stdout, /Release v1\.20\.0 /);
+	assert.match(explicit.stdout, /Rerun `pnpm version 1\.20\.0`/);
+	assert.equal(f.git('rev-parse', 'HEAD'), f.head);
+});
+
+test("pnpm version major moves the clone's own v1.0.0 out of pnpm's way and puts it back", () => {
+	const f = fixture();
+	f.git('tag', '-a', 'v1.0.0', '-m', 'the real 1.0.0', f.featureA);
+	const real = f.localRef('refs/tags/v1.0.0');
+	const r = f.pnpmVersion('1.0.0');
+	assert.equal(r.status, 0, r.stderr);
+	assert.match(r.stdout, /Release v2\.0\.0 /);
+	assert.equal(f.localRef('refs/tags/v1.0.0'), real);
+	assert.equal(f.git('rev-parse', 'HEAD'), f.head);
+	assert.equal(f.git('for-each-ref', 'refs/release-branch'), '');
+});
+
+test('a tag moved aside by a pnpm version that stopped early is put back by the next one', () => {
+	const f = fixture();
+	f.git('tag', '-a', 'v1.0.0', '-m', 'the real 1.0.0', f.featureA);
+	const real = f.localRef('refs/tags/v1.0.0');
+	f.git('update-ref', 'refs/release-branch/aside/v1.0.0', real);
+	f.git('tag', '-d', 'v1.0.0');
+	const r = f.pnpmVersion('0.0.1');
+	assert.equal(r.status, 0, r.stderr);
+	assert.equal(f.localRef('refs/tags/v1.0.0'), real);
+	assert.equal(f.git('for-each-ref', 'refs/release-branch'), '');
+});
+
+test('pnpm version --no-git-tag-version leaves package.json as it was', () => {
+	const f = fixture();
+	const r = f.pnpmVersion('0.0.1', { gitTagVersion: false });
+	assert.equal(r.status, 0, r.stderr);
+	assert.match(r.stdout, /Release v1\.13\.1 /);
+	assert.equal(f.git('status', '--porcelain'), '');
+	assert.equal(f.manifestVersion(), '0.0.0');
+});
+
+test('publish without the version hook releases nothing and says how to undo the bump', () => {
+	const f = fixture();
+	const r = f.pnpmVersion('0.0.1', { versionHook: false });
+	assert.equal(r.status, 1);
+	assert.match(r.stderr, /needs "version": "release-branch version" beside it/);
+	assert.match(r.stderr, /git tag -d v0\.0\.1 && git reset --keep HEAD\^/);
+	assert.doesNotMatch(f.calls(), /gh run list/);
+});
+
 test("1.x's pnpm version hooks stop it before anything is bumped, with the steps to move over", () => {
 	const f = fixture();
-	['check', 'branch', 'publish'].forEach(mode => {
+	['check', 'branch'].forEach(mode => {
 		const r = f.run(mode);
 		assert.equal(r.status, 1);
 		assert.match(r.stderr, /release-branch 2 releases by tagging a commit main already built/);
-		assert.match(r.stderr, /remove the preversion, version and postversion scripts/);
+		assert.match(r.stderr, /remove the preversion script/);
 	});
 });
