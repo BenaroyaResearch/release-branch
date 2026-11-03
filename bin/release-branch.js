@@ -17,11 +17,23 @@
 //     confirmed, such as an agent. Nothing is written before the release is
 //     created, so stopping at any point before that is safe.
 //
+//   release-branch version   (from the "version" hook)
+//   release-branch publish   (from the "postversion" hook)
+//     So that `pnpm version patch` (or minor, major, a version) releases the
+//     same way. pnpm always commits and tags the bump, and tells its hooks
+//     only the version it wrote, so publish undoes the commit and tag, reads
+//     the bump back from that version and runs `release` with it. The version
+//     hook runs before pnpm commits: it notes the commit pnpm starts from, and
+//     moves aside a local tag of the name pnpm is about to give its own (from
+//     0.0.0, a major is v1.0.0), which would stop pnpm before publish runs.
+//
 // The name is from 1.x, which committed the bump to a release/vX.Y.Z branch and
-// merged it through a PR. Its check, branch and publish modes now fail with the
-// steps to move an app over.
+// merged it through a PR. Its check and branch modes now fail with the steps to
+// move an app over.
 
 import { execFileSync } from 'node:child_process';
+import { once } from 'node:events';
+import { readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline/promises';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { parseArgs } from 'node:util';
@@ -33,6 +45,10 @@ const SEMVER = /^v?(\d+)\.(\d+)\.(\d+)$/;
 // image was not built, or not verified in staging.
 const PASSED = new Set(['success', 'skipped', 'neutral']);
 const USAGE = 'usage: release-branch release <patch|minor|major|X.Y.Z> [--target <sha>] [--dry-run] [--yes]';
+// What the version hook leaves for publish: the commit pnpm bumps on top of,
+// and the local tags moved out of pnpm's way.
+const BASE_REF = 'refs/release-branch/base';
+const ASIDE = 'refs/release-branch/aside/';
 
 const run = (cmd, args) => execFileSync(cmd, args, { encoding: 'utf8' }).trim();
 const git = (...args) => run('git', args);
@@ -167,7 +183,9 @@ async function confirm(question) {
 	const prompt = createInterface({ input: process.stdin, output: process.stdout });
 	try {
 		const asked = process.stdout.isTTY ? question : `${question.trimEnd()}\n`;
-		return /^y(es)?$/i.test((await prompt.question(asked)).trim());
+		// Ctrl-D closes the prompt without ever settling question().
+		const answer = await Promise.race([prompt.question(asked), once(prompt, 'close').then(() => '')]);
+		return /^y(es)?$/i.test(answer.trim());
 	} catch {
 		return false;
 	} finally {
@@ -192,7 +210,7 @@ async function findProdRun(sha) {
 	return `https://github.com/${repoSlug()}/actions/workflows/prod.yaml`;
 }
 
-async function release(args) {
+async function release(args, rerun = 'pnpm run release') {
 	let parsed;
 	try {
 		parsed = parseArgs({
@@ -248,7 +266,7 @@ async function release(args) {
 		return;
 	}
 	if (!values.yes && !await confirm(`Publish ${name} and deploy it to production? [y/N] `)) {
-		console.log(`\nNot published. Rerun \`pnpm run release ${wanted}\` when you are ready.\n`);
+		console.log(`\nNot published. Rerun \`${rerun} ${wanted}\` when you are ready.\n`);
 		return;
 	}
 	// gh ignores --target for a tag that already exists and releases whatever it
@@ -259,17 +277,88 @@ async function release(args) {
 	console.log(`\nProduction deploy: ${await findProdRun(sha)}\n`);
 }
 
+const hasRef = ref => succeeds('git', ['rev-parse', '--verify', '--quiet', ref]);
+// The app's package.json (lifecycle scripts start in the package root).
+const manifestVersion = () => JSON.parse(readFileSync('package.json', 'utf8')).version;
+
+// The bump pnpm was given, from the version it wrote over `from`: pnpm 12 tells
+// its hooks nothing else. From 0.0.0, 0.0.1 is a patch, 0.1.0 a minor and 1.0.0
+// a major; any other version was given as one.
+const bumpGiven = (from, to) => (SEMVER.test(from) && ['patch', 'minor', 'major'].find(word => nextVersion(from, word) === `v${to}`)) || to;
+
+// Put back the tags the version hook moved aside, over pnpm's tag of the same
+// name if it is still there: the one moved aside is the clone's copy of a real
+// release.
+function restoreAside() {
+	git('for-each-ref', '--format=%(refname)', ASIDE).split('\n').filter(Boolean).forEach(ref => {
+		git('update-ref', `refs/tags/${ref.slice(ASIDE.length)}`, git('rev-parse', ref));
+		git('update-ref', '-d', ref);
+	});
+}
+
+// The "version" hook: pnpm has written the new version and commits and tags it
+// next. If this clone already has a tag of that name, from an old release,
+// pnpm's `git tag` fails after the commit and publish never runs.
+function version() {
+	restoreAside();
+	git('update-ref', BASE_REF, 'HEAD');
+	const tag = `v${manifestVersion()}`;
+	if (hasRef(`refs/tags/${tag}`)) {
+		git('update-ref', `${ASIDE}${tag}`, git('rev-parse', `refs/tags/${tag}`));
+		git('update-ref', '-d', `refs/tags/${tag}`);
+	}
+}
+
+// pnpm's bump commit is the one on top of where the version hook noted it
+// started, and every tag on that commit is pnpm's. With --no-git-tag-version
+// there is no commit, only the new version in package.json.
+function undoBump(bumped) {
+	if (!hasRef(BASE_REF)) {
+		fail(`release-branch publish needs "version": "release-branch version" beside it in package.json. Nothing was released; to undo pnpm's ${bumped} bump, if it committed one:\n   git tag -d v${bumped} && git reset --keep HEAD^`);
+	}
+	const base = git('rev-parse', BASE_REF);
+	const head = git('rev-parse', 'HEAD');
+	if (head !== base && hasRef(`${head}^`) && git('rev-parse', `${head}^`) === base) {
+		git('tag', '--points-at', head).split('\n').filter(Boolean).forEach(name => git('tag', '-d', name));
+		git('reset', '--quiet', '--keep', base);
+	} else if (head === base) {
+		git('checkout', 'HEAD', '--', 'package.json');
+	} else {
+		restoreAside();
+		fail(`HEAD (${short(head)}) is not pnpm's bump on top of ${short(base)}, so it is left alone and nothing was released.`);
+	}
+	git('update-ref', '-d', BASE_REF);
+	restoreAside();
+}
+
+// The "postversion" hook. Once pnpm's bump is undone there is nothing local to
+// clean up, so it can stop anywhere, like `release`. When the hook succeeds,
+// pnpm goes on to print "Version bumped successfully" with the bump it made,
+// and nothing a hook does stops that (a failing hook prints an error instead),
+// so the last lines here say what that is. pnpm cuts each line at the
+// terminal's width, hence two short ones.
+async function publish() {
+	const bumped = manifestVersion();
+	undoBump(bumped);
+	const from = manifestVersion();
+	await release([bumpGiven(from, bumped)], 'pnpm version');
+	console.log(`Ignore pnpm's "${from} → ${bumped}" below: that bump was local and is undone,`);
+	console.log(`and package.json is still ${from}.\n`);
+}
+
 // 1.x's pnpm version hooks, in an app that has not moved over. Failing in
 // `check`, the preversion hook, stops pnpm version before it bumps anything.
 const MOVED = [
 	`release-branch 2 releases by tagging a commit ${BASE} already built: no version bump, branch or PR.`,
-	'   In package.json, remove the preversion, version and postversion scripts and keep',
-	'   "release": "release-branch release". Then release with `pnpm run release patch` (or minor,',
-	'   major, or a version). See https://github.com/BenaroyaResearch/release-branch#moving-from-1x',
+	'   In package.json, set "version" to "0.0.0", remove the preversion script, and set',
+	'   "version": "release-branch version" and "postversion": "release-branch publish".',
+	'   See https://github.com/BenaroyaResearch/release-branch#moving-from-1x',
 ].join('\n');
 
 const mode = process.argv[2];
 if (mode === 'release') await release(process.argv.slice(3));
-else if (['check', 'branch', 'publish'].includes(mode)) fail(MOVED);
+else if (mode === 'version') version();
+else if (mode === 'publish') await publish();
+else if (['check', 'branch'].includes(mode)) fail(MOVED);
 else fail(USAGE);
 /* eslint-enable no-console */
