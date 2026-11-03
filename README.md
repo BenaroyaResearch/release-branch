@@ -2,7 +2,7 @@
 
 Releases for BRI Node apps that build their image once, on the pull request,
 and promote it by retag. A release is a tag on a commit `main` has already
-built and deployed to staging: `pnpm version patch` picks the next version,
+built and deployed to staging: `pnpm release patch` picks the next version,
 checks that commit's pipelines passed, asks, and publishes the GitHub release
 that deploys it to production. Nothing is committed, so there is no release
 branch, no release PR, no new image, and `main` does not move.
@@ -19,12 +19,12 @@ through a PR, hence the name.
 ## Releasing
 
 ```bash
-pnpm version patch     # or minor, major, or a version such as 1.14.0
+pnpm release patch     # or minor, major, or a version such as 1.14.0
 ```
 
-`pnpm run release patch` does the same, and is the one that takes the options
-below. It reads `origin`, not your working tree, so any checkout on any branch
-will do, as long as the working tree is clean for `pnpm version`. It:
+That is `pnpm run release patch`: pnpm runs a script without `run` when it has
+no command of that name. It reads `origin`, not your working tree, so any
+checkout on any branch will do. It:
 
 - fetches `main` and takes its head, or the commit `--target <sha>` names,
   which must be on `main` because the prod workflow refuses anything else;
@@ -45,26 +45,15 @@ will do, as long as the working tree is clean for `pnpm version`. It:
 Nothing is written before the release is created, so Ctrl-C, or answering no,
 leaves nothing to clean up.
 
-`pnpm version` cannot be told not to bump: it writes the new version into
-`package.json`, commits and tags it locally, and tells its hooks only the
-version it wrote. So before any of the above, the `postversion` hook undoes
-that commit and tag, and reads the bump back from the version: from `0.0.0`,
-`0.0.1` is a patch, `0.1.0` a minor and `1.0.0` a major, and anything else is
-the version to release. pnpm still ends with "Version bumped successfully" and
-`0.0.0 → 0.0.1`, which no hook can stop, so the hook's last lines say that it
-is the local bump, already undone. Pass an explicit `0.0.1`, `0.1.0` or
-`1.0.0` to `pnpm run release`, since `pnpm version` reads them as a bump.
-
-pnpm shows a running hook's output in a box that folds all but its last lines
-into `[N lines collapsed]`, with `Running...` under it, so on a terminal the
-hook writes to the terminal directly instead, and reads like
-`pnpm run release`.
-
 `--dry-run` stops before the question. `--yes` publishes without asking, for a
 caller that has already confirmed, such as an agent; pass it with
 `--target <the SHA a dry run showed>`, so the commit cannot change in between.
-Neither reaches `pnpm version`'s hooks, and without a terminal to ask on,
-`pnpm version` never publishes.
+
+`pnpm version` does not release, and the app's `preversion` hook stops it
+before it bumps anything, saying to run `pnpm release` instead. pnpm version
+always commits and tags a bump locally, takes no options, and folds its hooks'
+output into a box, so 2.1, which released from its hooks, had to undo the bump
+and work around the box.
 
 Releasing a commit older than the latest release works, and is how to roll
 production back: it warns that production goes back to older code.
@@ -87,8 +76,8 @@ production back: it warns that production goes back to older code.
    `process.env.APP_VERSION` wherever it showed `package.json`'s version. A
    client bundle cannot hold it, since the bundle is built with the image:
    serve it from the server.
-2. **The package and three scripts**, with `version` left at `0.0.0` so
-   nobody mistakes it for the release:
+2. **The package and two scripts**, with `version` left at `0.0.0` so nobody
+   mistakes it for the release:
 
    ```bash
    pnpm add -D @benaroyaresearch/release-branch
@@ -97,17 +86,13 @@ production back: it warns that production goes back to older code.
    ```json
    "version": "0.0.0",
    "scripts": {
-     "version": "release-branch version",
-     "postversion": "release-branch publish",
+     "preversion": "release-branch check",
      "release": "release-branch release"
    }
    ```
 
-   The `version` hook runs before pnpm commits its bump. It notes where pnpm
-   started and moves aside any local tag with the name pnpm is about to use,
-   so that `pnpm version major` from `0.0.0` does not fail on the clone's
-   copy of `v1.0.0`; `publish` puts it back. Neither hook builds anything:
-   the image was built on the pull request.
+   `preversion` is there for whoever types `pnpm version patch` from habit:
+   without it, pnpm commits and tags a `0.0.1` bump locally and stops.
 
 3. **"Require branches to be up to date before merging" on `main`**, which the
    ci-pipeline skill sets up. With no release PR, nothing re-tests `main`
@@ -127,26 +112,29 @@ public, so an app's CI and image build can install it with no access grant.
 1. Merge the fluxcd overlay change and the app's `APP_VERSION` change above,
    then check that staging's version reads `staging-<sha>-<ts>`. A 1.x release
    still works at this point, and production then reads its semver.
-2. In `package.json`, set the scripts to the three above (remove
-   `preversion`, and the build from `version`), set `version` to `0.0.0`, and
-   upgrade: `pnpm add -D @benaroyaresearch/release-branch@^2.1`.
+2. In `package.json`, set the scripts to the two above (keep `preversion`,
+   remove `version` and `postversion`), set `version` to `0.0.0`, and
+   upgrade: `pnpm add -D @benaroyaresearch/release-branch@^3`.
 
-The first 2.x release counts on from the last 1.x tag. Until step 2, 2.x
-refuses to run from 1.x's `preversion` and `version` hooks, so `pnpm version`
-stops before it bumps anything and prints these steps.
+The first release after the move counts on from the last 1.x tag. Until step
+2, 3.x's hooks stop `pnpm version` before it bumps anything and point here.
 
-An app already on 2.0 only adds the `version` and `postversion` scripts. Until
-it does, `pnpm version` there just commits and tags a bump locally.
+## Moving from 2.x
+
+Upgrade (`pnpm add -D @benaroyaresearch/release-branch@^3`) and set the
+scripts to the two above: a 2.1 app replaces its `version` and `postversion`
+scripts with `preversion`, and a 2.0 app adds it. Then release with
+`pnpm release patch`. Until the scripts change, 3.x stops `pnpm version` at
+2.1's `version` hook, before it commits, puts `package.json` back, and says
+which scripts to replace.
 
 ## Changing this package
 
-`npm test` runs `release` against a throwaway origin repo and a fake `gh`, so
-nothing touches GitHub. The fake's `release create` makes the tag on the
-throwaway origin at `--target`, as GitHub does, and the hooks run the way
-pnpm 12 runs them: write the version, `version`, commit and tag,
-`postversion`. The interactive confirmation is not covered by the tests: with
-no terminal and no `--yes`, `release` must never publish, and that is what
-they check.
+`npm test` runs `release` and the hooks against a throwaway origin repo and a
+fake `gh`, so nothing touches GitHub. The fake's `release create` makes the
+tag on the throwaway origin at `--target`, as GitHub does. The interactive
+confirmation is not covered by the tests: with no terminal and no `--yes`,
+`release` must never publish, and that is what they check.
 
 To publish a new version: bump `version` in `package.json` in a PR, merge it,
 then publish a GitHub release tagged `v<that version>`. The publish workflow
