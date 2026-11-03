@@ -33,10 +33,11 @@
 
 import { execFileSync } from 'node:child_process';
 import { once } from 'node:events';
-import { readFileSync } from 'node:fs';
+import { openSync, readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline/promises';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { parseArgs } from 'node:util';
+import { WriteStream } from 'node:tty';
+import { format, parseArgs } from 'node:util';
 
 const BASE = 'main';
 const POLL_MS = 30_000;
@@ -50,9 +51,13 @@ const USAGE = 'usage: release-branch release <patch|minor|major|X.Y.Z> [--target
 const BASE_REF = 'refs/release-branch/base';
 const ASIDE = 'refs/release-branch/aside/';
 
+// Where the output goes: stdout, or the terminal itself (see writeToTerminal).
+let out = process.stdout;
+let terminalFd = null;
+
 const run = (cmd, args) => execFileSync(cmd, args, { encoding: 'utf8' }).trim();
 const git = (...args) => run('git', args);
-const passthrough = (cmd, args) => execFileSync(cmd, args, { stdio: 'inherit' });
+const passthrough = (cmd, args) => execFileSync(cmd, args, { stdio: terminalFd === null ? 'inherit' : ['inherit', terminalFd, terminalFd] });
 const succeeds = (cmd, args) => {
 	try {
 		execFileSync(cmd, args, { stdio: 'ignore' });
@@ -172,17 +177,17 @@ function changesSince(from, sha) {
 }
 
 // Anything but y/yes is a no, including Ctrl-D, Ctrl-C and having no terminal.
-// pnpm 12 runs scripts with stdin on the terminal but stdout piped through its
-// reporter, which shows only whole lines, so there the question ends in a
-// newline. Without it nothing shows until Enter, which answers no.
+// Output piped through pnpm 12's reporter shows only whole lines, so there the
+// question ends in a newline. Without it nothing shows until Enter, which
+// answers no.
 async function confirm(question) {
 	if (!process.stdin.isTTY) {
 		console.log('No terminal to confirm on, so not publishing.');
 		return false;
 	}
-	const prompt = createInterface({ input: process.stdin, output: process.stdout });
+	const prompt = createInterface({ input: process.stdin, output: out });
 	try {
-		const asked = process.stdout.isTTY ? question : `${question.trimEnd()}\n`;
+		const asked = out.isTTY ? question : `${question.trimEnd()}\n`;
 		// Ctrl-D closes the prompt without ever settling question().
 		const answer = await Promise.race([prompt.question(asked), once(prompt, 'close').then(() => '')]);
 		return /^y(es)?$/i.test(answer.trim());
@@ -331,13 +336,36 @@ function undoBump(bumped) {
 	restoreAside();
 }
 
+// pnpm 12 pipes a hook's output into a live box on the terminal, which folds
+// all but its last lines into "[N lines collapsed]" and keeps "Running..."
+// under the question while it waits for the answer. So with a terminal there,
+// write to the terminal directly, below the box: pnpm leaves the screen alone
+// until the hook exits, then moves up a line and writes "Done" (or "Failed").
+// Clear pnpm's "Running..." line first, and that last line is the blank line
+// every exit here ends with. Without a terminal, pnpm's output is plain lines.
+function writeToTerminal() {
+	if (!process.stdin.isTTY || process.stdout.isTTY) return;
+	try {
+		terminalFd = openSync('/dev/tty', 'w');
+	} catch {
+		return;
+	}
+	out = new WriteStream(terminalFd);
+	let clear = '\x1b[1A\x1b[2K';
+	console.log = (...args) => {
+		out.write(`${clear}${format(...args)}\n`);
+		clear = '';
+	};
+	console.error = console.log;
+}
+
 // The "postversion" hook. Once pnpm's bump is undone there is nothing local to
 // clean up, so it can stop anywhere, like `release`. When the hook succeeds,
 // pnpm goes on to print "Version bumped successfully" with the bump it made,
 // and nothing a hook does stops that (a failing hook prints an error instead),
-// so the last lines here say what that is. pnpm cuts each line at the
-// terminal's width, hence two short ones.
+// so the last lines here say what that is, short enough not to wrap.
 async function publish() {
+	writeToTerminal();
 	const bumped = manifestVersion();
 	undoBump(bumped);
 	const from = manifestVersion();
