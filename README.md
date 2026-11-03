@@ -55,6 +55,11 @@ the version to release. pnpm still ends with "Version bumped successfully" and
 is the local bump, already undone. Pass an explicit `0.0.1`, `0.1.0` or
 `1.0.0` to `pnpm run release`, since `pnpm version` reads them as a bump.
 
+pnpm shows a running hook's output in a box that folds all but its last lines
+into `[N lines collapsed]`, with `Running...` under it, so on a terminal the
+hook writes to the terminal directly instead, and reads like
+`pnpm run release`.
+
 `--dry-run` stops before the question. `--yes` publishes without asking, for a
 caller that has already confirmed, such as an agent; pass it with
 `--target <the SHA a dry run showed>`, so the commit cannot change in between.
